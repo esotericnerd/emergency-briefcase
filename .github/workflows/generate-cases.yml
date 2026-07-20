@@ -1,0 +1,190 @@
+name: Generate ABEM Cases with Claude
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_file:
+        description: "Path to the case request file (e.g., case-requests/cardiology.md)"
+        required: true
+        type: string
+  push:
+    paths:
+      - 'case-requests/*.md'
+    branches:
+      - main
+
+jobs:
+  generate-cases:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      
+      - name: Determine request file
+        id: request
+        run: |
+          if [ -n "${{ github.event.inputs.request_file }}" ]; then
+            FILE="${{ github.event.inputs.request_file }}"
+          else
+            FILE=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }} | grep "case-requests/" | head -1)
+          fi
+          echo "file=$FILE" >> $GITHUB_OUTPUT
+      
+      - name: Read case request
+        id: read_request
+        run: |
+          if [ -f "${{ steps.request.outputs.file }}" ]; then
+            CONTENT=$(cat "${{ steps.request.outputs.file }}")
+            echo "content<<EOF" >> $GITHUB_OUTPUT
+            echo "$CONTENT" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Call Claude API to generate cases
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          PROMPT=$(cat << 'PROMPT_END'
+          You are an emergency medicine education expert generating ABEM-style board review cases.
+          
+          User request:
+          ${{ steps.read_request.outputs.content }}
+          
+          Generate cases in this exact JSON array format. NO preamble, NO markdown, ONLY valid JSON:
+          
+          [
+            {
+              "category": "Category Name",
+              "specialty": "Specialty Name",
+              "presentation": "Clinical scenario with patient demographics, chief complaint, and physical exam findings",
+              "vitals": "HR XX, BP XXX/XX, RR XX, SpO2 XX% on room air, T XX.X°C",
+              "question": "The specific board-style stem question",
+              "options": [
+                "Option A (correct answer)",
+                "Option B (plausible distractor)",
+                "Option C (plausible distractor)",
+                "Option D (plausible distractor)"
+              ],
+              "correctIndex": 0,
+              "explanation": "Detailed explanation of why the correct answer is right, why distractors are wrong, and key learning points for the exam",
+              "urgency": "high|medium|low",
+              "isPublic": true,
+              "createdBy": "admin"
+            }
+          ]
+          
+          Rules:
+          1. Generate 5-10 cases per request
+          2. Randomize correctIndex (don't cluster all 0s or 1s)
+          3. category and specialty must match exactly
+          4. options must be strings WITHOUT A/B/C/D prefixes
+          5. Keep explanations concise but thorough
+          6. Mix difficulty levels within the batch
+          7. Mix urgency (high/medium/low) distribution
+          8. Ensure clinical accuracy for ABEM standards
+          9. Return ONLY the JSON array, nothing else
+          PROMPT_END
+          )
+          
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "content-type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "{
+              \"model\": \"claude-opus-4-6\",
+              \"max_tokens\": 4000,
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": \"$PROMPT\"
+              }]
+            }")
+          
+          # Extract JSON from response
+          CASES=$(echo "$RESPONSE" | jq -r '.content[0].text')
+          echo "cases<<EOF" >> $GITHUB_OUTPUT
+          echo "$CASES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      
+      - name: Assign orderIndex values
+        id: assign_index
+        run: |
+          # Get the last orderIndex from git history or Firebase
+          LAST_INDEX=255  # Update this after each batch manually, or query Firebase
+          
+          CASES='${{ steps.claude.outputs.cases }}'
+          UPDATED_CASES=$(echo "$CASES" | jq --arg start "$((LAST_INDEX + 1))" '
+            . as $arr |
+            ($arr | length) as $count |
+            [
+              $arr[] |
+              . + {orderIndex: ($start | tonumber + ($arr | index(.) | tonumber))}
+            ]
+          ')
+          
+          echo "cases_with_index<<EOF" >> $GITHUB_OUTPUT
+          echo "$UPDATED_CASES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+      
+      - name: Create generated cases file
+        run: |
+          mkdir -p generated/cases
+          cat > generated/cases/generated-$(date +%s).json << 'EOF'
+          ${{ steps.assign_index.outputs.cases_with_index }}
+          EOF
+      
+      - name: Create uploader-ready Node.js script
+        run: |
+          cat > generated/upload-generated-cases.js << 'UPLOAD_SCRIPT_END'
+          const admin = require("firebase-admin");
+          const serviceAccount = require("./service-account-key.json");
+          const fs = require("fs");
+          const path = require("path");
+          
+          admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount),
+          });
+          
+          const db = admin.firestore();
+          
+          // Read the most recent generated cases file
+          const generatedDir = path.join(__dirname, "..", "generated", "cases");
+          const files = fs.readdirSync(generatedDir)
+            .filter(f => f.endsWith(".json"))
+            .sort()
+            .reverse();
+          
+          if (files.length === 0) {
+            console.error("No generated case files found");
+            process.exit(1);
+          }
+          
+          const caseFile = path.join(generatedDir, files[0]);
+          const cases = JSON.parse(fs.readFileSync(caseFile, "utf-8"));
+          
+          async function upload() {
+            for (const c of cases) {
+              await db.collection("cases").add({
+                ...c,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+              console.log(`Uploaded orderIndex ${c.orderIndex}: ${c.category}`);
+            }
+            console.log(`Done. Uploaded ${cases.length} cases from ${files[0]}`);
+            process.exit(0);
+          }
+          
+          upload().catch((err) => {
+            console.error(err);
+            process.exit(1);
+          });
+          UPLOAD_SCRIPT_END
+      
+      - name: Commit generated cases
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add generated/
+          git commit -m "Generated ABEM cases: ${{ steps.request.outputs.file }}"
+          git push
